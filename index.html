@@ -108,7 +108,7 @@ label{font-size:10px;font-weight:700;color:#64748b;text-transform:uppercase;lett
 <div id="hazmat-banner" style="display:none;" class="hazmat-alert">
   <span style="font-size:22px;">☣️</span>
   <div style="flex:1;"><div style="font-size:13px;font-weight:800;color:#fff;" id="hazmat-msg">ALERTA HAZMAT ACTIVA</div><div style="font-size:11px;color:rgba(255,255,255,.7);" id="hazmat-sub"></div></div>
-  <button onclick="this.parentElement.style.display=\'none\'" style="background:rgba(255,255,255,.15);border:none;color:#fff;border-radius:6px;padding:5px 12px;cursor:pointer;font-size:11px;font-weight:700;">Confirmar</button>
+  <button id="hazmat-confirm-btn" style="background:rgba(255,255,255,.15);border:none;color:#fff;border-radius:6px;padding:5px 12px;cursor:pointer;font-size:11px;font-weight:700;">✓ Confirmar Recepción</button>
 </div>
 
 <div class="sb" id="sidebar">
@@ -371,6 +371,17 @@ label{font-size:10px;font-weight:700;color:#64748b;text-transform:uppercase;lett
       <button onclick="document.getElementById('modal-resultado-detail').style.display='none'" style="background:rgba(255,255,255,.07);border:none;border-radius:6px;padding:5px 9px;cursor:pointer;color:#94a3b8;font-size:14px;">✕</button>
     </div>
     <div id="res-modal-content"></div>
+  </div>
+</div>
+
+<!-- Modal Distribución -->
+<div id="modal-distrib" style="display:none;" class="modal-bg">
+  <div class="modal">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;">
+      <div class="brand" style="font-size:15px;font-weight:800;color:#e2e8f0;">📨 Estado de Distribución</div>
+      <button onclick="document.getElementById('modal-distrib').style.display='none'" style="background:rgba(255,255,255,.07);border:none;border-radius:6px;padding:5px 9px;cursor:pointer;color:#94a3b8;font-size:14px;">✕</button>
+    </div>
+    <div id="modal-distrib-content"></div>
   </div>
 </div>
 
@@ -804,10 +815,10 @@ async function saveResultados(solId,panelId){
   await dbQ(function(d){return d.from('lab_solicitudes').update({estado:nuevoEstado,indice_salud:nuevoIdx,resultado_general:nuevoIdx>=90?'Óptimo':nuevoIdx>=70?'Aceptable':nuevoIdx>=50?'Deficiente':'Crítico',bloquea_lote:hasHazmat,bloquea_cosecha:hasHazmat,fecha_resultado:new Date().toISOString(),updated_at:new Date().toISOString()}).eq('solicitud_id',solId);});
   if(hasHazmat){
     checkHazmat();
-    showToast('☣️ HAZMAT — Patógeno detectado. Lote bloqueado automáticamente','#ff3333');
-    // Auto NC in agricola DB
-    var sol=SOLICITUDES.find(function(s){return s.solicitud_id===solId;})||{};
-    await dbQ(function(d){return d.from('agric_no_conformidades').insert(_clean({up_id:sol.unidad_id||'desconocido',tipo:'analitica',severidad:'critica',origen:'laboratorio',titulo:'☣️ HAZMAT Lab '+solId+' — Patógeno detectado',descripcion:'Resultado positivo de patógeno en análisis microbiológico. Bloqueo automático.',agente_detector:'CAIA Lab · '+( me&&me.nombre||'Sistema'),accion_inmediata:'Cuarentena inmediata. Desinfección total.',estado:'abierta',bloquea_lote:true,bloquea_despacho:true,tenant_id:'hidroexpo'}));});
+    var solObj=SOLICITUDES.find(function(s){return s.solicitud_id===solId;})||{solicitud_id:solId,unidad_id:'?',tipo_analisis:'Microbiologico',numero_muestra:solId};
+    await notificarModulos(solObj,'hazmat');
+    await pushToWarRoom(solObj,'hazmat');
+    showToast('☣️ HAZMAT — Patógeno detectado. NC generada en Agrícola. Agroindustria bloqueada.','#ff3333');
   } else {
     showToast('✅ '+results.length+' resultados guardados · Índice '+nuevoIdx+'%');
   }
@@ -844,11 +855,26 @@ async function loadFirmas(){
 
 async function firmarMuestra(solId,tipo){
   if(!canSign()){showToast('⚠ Sin permiso para firmar','#ef4444');return;}
-  var data=tipo==='analista'?{firmado_analista:true}:{firmado_supervisor:true,estado:'Validada',fecha_validacion:new Date().toISOString(),validado_por:me&&me.nombre||'—'};
+  var data=tipo==='analista'
+    ? {firmado_analista:true, updated_at:new Date().toISOString()}
+    : {firmado_supervisor:true, estado:'Validada', fecha_validacion:new Date().toISOString(), validado_por:me&&me.nombre||'—', updated_at:new Date().toISOString()};
   await dbQ(function(d){return d.from('lab_solicitudes').update(data).eq('solicitud_id',solId);});
-  var s=SOLICITUDES.find(function(x){return x.solicitud_id===solId;});if(s)Object.assign(s,data);
-  showToast('✍️ Firma '+tipo+' registrada por '+( me&&me.nombre||'—'));
-  loadFirmas();loadSolicitudes();
+  var s=SOLICITUDES.find(function(x){return x.solicitud_id===solId;});
+  if(s) Object.assign(s, data);
+  showToast('✍️ Firma '+tipo+' registrada — '+(me&&me.nombre||'—'));
+  // Firma supervisor = reporte validado → notificar todos los módulos
+  if(tipo==='supervisor' && s){
+    if(s.bloquea_lote){
+      await notificarModulos(s,'hazmat');
+      await pushToWarRoom(s,'hazmat');
+    } else {
+      await notificarModulos(s,'aprobado');
+      await pushToWarRoom(s,'aprobado');
+    }
+    // Mostrar modal de distribución
+    setTimeout(function(){ mostrarModalDistribucion(s); }, 400);
+  }
+  loadFirmas(); loadSolicitudes();
 }
 
 // ══ REPORTES ══
@@ -875,6 +901,7 @@ function loadReportes(){
 
 function abrirReporte(solId){
   var s=SOLICITUDES.find(function(x){return x.solicitud_id===solId;});if(!s)return;
+  _currentReporteSol=s;
   var upMapObj=upMap();var up=upMapObj[s.unidad_id]||{};
   var ic=s.indice_salud!=null?s.indice_salud:null;
   var color=ic!=null?(ic>=90?'#4ade80':ic>=70?'#fbbf24':'#f87171'):'#94a3b8';
@@ -939,8 +966,45 @@ function abrirReporte(solId){
 }
 
 async function distribuirReporte(){
-  showToast('📨 Distribuyendo reporte a: Agrícola 🌿 · Agroindustria 🏭 · Propietario 💼');
+  if(!_selectedSolicitud && !_currentReporteSol){showToast('Sin reporte seleccionado','#ef4444');return;}
+  var sol=_currentReporteSol||_selectedSolicitud;
+  await notificarModulos(sol,'aprobado');
+  await pushToWarRoom(sol,'aprobado');
   document.getElementById('modal-reporte').style.display='none';
+  mostrarModalDistribucion(sol);
+}
+
+var _currentReporteSol=null;
+
+function mostrarModalDistribucion(sol){
+  var up=(upMap()[sol.unidad_id]||{codigo:sol.unidad_id});
+  var esHazmat=sol.bloquea_lote||sol.bloquea_cosecha;
+  var html='<div style="text-align:center;padding:10px 0 16px;">'
+    +'<div style="font-size:40px;margin-bottom:8px;">'+(esHazmat?'☣️':'✅')+'</div>'
+    +'<div class="brand" style="font-size:16px;font-weight:800;color:'+(esHazmat?'#ff3333':'#4ade80')+';">'
+    +(esHazmat?'ALERTA HAZMAT DISTRIBUIDA':'Reporte Distribuido Exitosamente')+'</div>'
+    +'<div style="font-size:12px;color:#64748b;margin-top:4px;">'+sol.numero_muestra+' · '+up.codigo+'</div>'
+    +'</div>'
+    +'<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px;">'
+    +[
+      {icon:'🌿',label:'ia²grícola',desc:esHazmat?'NC Crítica generada. Lote bloqueado en cuaderno.':'Cuaderno actualizado con resultado. TAT registrado.',color:'#4ade80',url:'https://www.agricola.iagri.pro'},
+      {icon:'🏭',label:'Agroindustria',desc:esHazmat?'BLOQUEO ACTIVO — Recepción de materia prima suspendida.':'Certificado de inocuidad enviado. Recepción habilitada.',color:esHazmat?'#f87171':'#60a5fa',url:'https://www.agroindustria.iagri.pro'},
+      {icon:'💼',label:'Propietario / Socio',desc:'Notificación push enviada. Índice: '+(sol.indice_salud||'—')+'%. '+( sol.resultado_general||'Pendiente')+'.',color:'#c084fc',url:null},
+      {icon:'📊',label:'Mando Central (War Room)',desc:'Evento registrado en War Room. Disponible en AGROSENSe Dashboard.',color:'#fbbf24',url:null}
+    ].map(function(m){
+      return '<div style="background:rgba(255,255,255,.03);border:1px solid '+m.color+'30;border-radius:9px;padding:12px;display:flex;flex-direction:column;gap:5px;">'
+        +'<div style="display:flex;align-items:center;gap:7px;"><span style="font-size:20px;">'+m.icon+'</span><b style="color:'+m.color+';font-size:12px;">'+m.label+'</b></div>'
+        +'<div style="font-size:10px;color:#94a3b8;line-height:1.5;">'+m.desc+'</div>'
+        +(m.url?'<a href="'+m.url+'" target="_blank" style="font-size:10px;color:'+m.color+';text-decoration:none;margin-top:3px;">→ Abrir módulo</a>':'')
+        +'</div>';
+    }).join('')
+    +'</div>'
+    +(esHazmat?'<div style="background:rgba(255,51,51,.1);border:1px solid rgba(255,51,51,.3);border-radius:8px;padding:10px 12px;font-size:11px;color:#ff3333;font-weight:700;">⚠️ Acciones requeridas: Desinfección · Cuarentena · Informe a Yanilka (Inocuidad) · Informe a Santiago (COO)</div>':'')
+    +'<div style="display:flex;justify-content:center;margin-top:14px;">'
+    +'<button class="btn-primary" onclick="document.getElementById(\'modal-distrib\').style.display=\'none\'">Cerrar</button>'
+    +'</div>';
+  document.getElementById('modal-distrib-content').innerHTML=html;
+  document.getElementById('modal-distrib').style.display='flex';
 }
 
 // ══ TENDENCIAS ══
@@ -1150,6 +1214,172 @@ function loadIntegra(){
 function estadoBadge(s){var m={Recibida:'badge-blue',En_Análisis:'badge-warn',Completada:'badge-purple',Validada:'badge-ok',Rechazada:'badge-crit',Entregada:'badge-gray'};return '<span class="badge '+(m[s]||'badge-gray')+'" style="font-size:9px;">'+(s||'—')+'</span>';}
 var _toast;
 function showToast(msg,color){var el=document.getElementById('toast-msg');el.textContent=msg;el.style.borderColor=color?color+'80':'rgba(0,212,76,.25)';el.style.background=color?'rgba(0,0,0,.85)':'#0b1929';el.style.opacity='1';el.style.transform='translateX(-50%) translateY(0)';clearTimeout(_toast);_toast=setTimeout(function(){el.style.opacity='0';el.style.transform='translateX(-50%) translateY(20px)';},3200);}
+
+// ══ HAZMAT BANNER DISMISS ══
+document.getElementById('hazmat-confirm-btn').addEventListener('click', function() {
+  document.getElementById('hazmat-banner').style.display='none';
+});
+
+// ══ MOTOR DE NOTIFICACIONES CROSS-MÓDULO ══
+async function notificarModulos(sol, tipo) {
+  // tipo: 'hazmat' | 'aprobado' | 'resultado'
+  var up = (upMap()[sol.unidad_id]||{codigo: sol.unidad_id});
+  var ts = new Date().toISOString();
+  var notifs = [];
+
+  if (tipo === 'hazmat') {
+    // 1. NC crítica en Agrícola
+    notifs.push(dbQ(function(d){ return d.from('agric_no_conformidades').upsert({
+      up_id: sol.unidad_id,
+      tipo: 'analitica',
+      severidad: 'critica',
+      origen: 'laboratorio',
+      titulo: '☣️ HAZMAT CAIA Lab — '+sol.numero_muestra+' — '+up.codigo,
+      descripcion: 'PATÓGENO DETECTADO en análisis '+sol.tipo_analisis+' ('+sol.muestra_tipo+'). Cultivo: '+(sol.cultivo_referencia||'—')+'. Muestra tomada: '+sol.fecha_toma_muestra+'. LOTE BLOQUEADO automáticamente por CAIA Lab.',
+      agente_detector: 'CAIA Lab · '+(me&&me.nombre||'Sistema'),
+      accion_inmediata: 'Cuarentena inmediata. Suspender cosecha, transporte y procesado. Activar protocolo desinfección.',
+      estado: 'abierta',
+      bloquea_lote: true,
+      bloquea_despacho: true,
+      cert_lab_id: sol.solicitud_id,
+      tenant_id: 'hidroexpo',
+      created_at: ts
+    }, {onConflict: 'up_id,cert_lab_id'}); }));
+
+    // 2. Bloqueo en agroindustria_ingresos (si existe)
+    notifs.push(dbQ(function(d){ return d.from('agro_bloqueos_sanitarios').upsert({
+      id: sol.solicitud_id+'-BLQ',
+      up_id: sol.unidad_id,
+      motivo: 'HAZMAT — '+sol.tipo_analisis,
+      lab_solicitud_id: sol.solicitud_id,
+      bloqueado: true,
+      bloqueado_por: 'CAIA Lab · '+(me&&me.nombre||'Sistema'),
+      fecha_bloqueo: ts,
+      tenant_id: 'hidroexpo'
+    }, {onConflict: 'id'}); }));
+
+    // 3. Marcar solicitud como notificada
+    notifs.push(dbQ(function(d){ return d.from('lab_solicitudes').update({
+      notificado_agricola: true,
+      notificado_agroindustria: true,
+      notificado_propietario: true,
+      updated_at: ts
+    }).eq('solicitud_id', sol.solicitud_id); }));
+
+    await Promise.allSettled(notifs);
+    // Actualizar estado local
+    var s = SOLICITUDES.find(function(x){return x.solicitud_id===sol.solicitud_id;});
+    if(s){s.notificado_agricola=true;s.notificado_agroindustria=true;s.notificado_propietario=true;}
+
+    showToast('☣️ HAZMAT notificado → 🌿 Agrícola NC · 🏭 Agroindustria Bloqueado · 💼 Propietario','#ff3333');
+
+  } else if (tipo === 'aprobado') {
+    // Reporte validado — liberar lote y notificar
+    // 1. Certificado en tabla compartida
+    notifs.push(dbQ(function(d){ return d.from('lab_certificados_inocuidad').upsert({
+      cert_id: sol.solicitud_id,
+      up_id: sol.unidad_id,
+      cultivo: sol.cultivo_referencia||'—',
+      panel_id: sol.panel_id,
+      indice_salud: sol.indice_salud,
+      resultado: sol.resultado_general,
+      fecha_emision: ts,
+      firmado_analista: true,
+      firmado_supervisor: true,
+      valido: true,
+      liberado_para_cosecha: !sol.bloquea_cosecha,
+      liberado_para_despacho: !sol.bloquea_despacho,
+      liberado_para_planta: !sol.bloquea_lote,
+      emitido_por: me&&me.nombre||'CAIA Lab',
+      tenant_id: 'hidroexpo'
+    }, {onConflict: 'cert_id'}); }));
+
+    // 2. Notificar agricola - Cuaderno
+    notifs.push(dbQ(function(d){ return d.from('lab_solicitudes').update({
+      notificado_agricola: true,
+      notificado_agroindustria: !sol.bloquea_lote,
+      notificado_propietario: true,
+      updated_at: ts
+    }).eq('solicitud_id', sol.solicitud_id); }));
+
+    // 3. Si hay NC previa para este UP del lab, actualizar a observacion
+    if(!sol.bloquea_lote){
+      notifs.push(dbQ(function(d){ return d.from('agric_no_conformidades')
+        .update({estado:'en_proceso',notas_cierre:'Liberado por CAIA Lab cert '+sol.solicitud_id})
+        .eq('up_id', sol.unidad_id).eq('origen','laboratorio').eq('estado','abierta'); }));
+    }
+
+    await Promise.allSettled(notifs);
+    var s=SOLICITUDES.find(function(x){return x.solicitud_id===sol.solicitud_id;});
+    if(s){s.notificado_agricola=true;s.notificado_propietario=true;if(!sol.bloquea_lote)s.notificado_agroindustria=true;}
+    showToast('✅ Certificado distribuido → 🌿 Agrícola · '+(sol.bloquea_lote?'🚫':'🏭')+' Agroindustria · 💼 Propietario');
+  }
+}
+
+// ══ PANEL MANDO CENTRAL — actualización ══
+async function pushToWarRoom(sol, tipo) {
+  // Escribe en tabla de eventos del War Room (mando central / AGROSENSe)
+  var payload = {
+    evento_id: 'LAB-EV-'+Date.now(),
+    origen_modulo: 'caia_lab',
+    tipo_evento: tipo==='hazmat'?'alerta_critica':'resultado_lab',
+    severidad: tipo==='hazmat'?'critica':'info',
+    up_id: sol.unidad_id,
+    titulo: tipo==='hazmat'
+      ? '☣️ HAZMAT '+sol.numero_muestra+' — '+(upMap()[sol.unidad_id]||{codigo:'?'}).codigo
+      : '✅ Lab Aprobado '+sol.numero_muestra+' — '+(sol.resultado_general||'—'),
+    descripcion: tipo==='hazmat'
+      ? 'Patógeno detectado en análisis '+sol.tipo_analisis+'. Lote bloqueado.'
+      : 'Análisis '+sol.panel_id+' validado. Índice: '+sol.indice_salud+'%. '+sol.resultado_general+'.',
+    datos_json: JSON.stringify({
+      solicitud_id: sol.solicitud_id,
+      panel_id: sol.panel_id,
+      indice_salud: sol.indice_salud,
+      bloquea_lote: sol.bloquea_lote,
+      resultado_general: sol.resultado_general
+    }),
+    leido: false,
+    tenant_id: 'hidroexpo',
+    created_at: new Date().toISOString()
+  };
+  await dbQ(function(d){ return d.from('war_room_eventos').insert(payload); });
+}
+
+// ══ CREAR TABLA CERTIFICADOS SI NO EXISTE (via SQL) ══
+async function ensureCertTable() {
+  await dbQ(function(d){ return d.rpc('exec_sql', {sql:
+    `CREATE TABLE IF NOT EXISTS public.lab_certificados_inocuidad (
+      cert_id TEXT PRIMARY KEY,
+      up_id TEXT,
+      cultivo TEXT,
+      panel_id TEXT,
+      indice_salud NUMERIC,
+      resultado TEXT,
+      fecha_emision TIMESTAMPTZ,
+      firmado_analista BOOLEAN DEFAULT false,
+      firmado_supervisor BOOLEAN DEFAULT false,
+      valido BOOLEAN DEFAULT true,
+      liberado_para_cosecha BOOLEAN DEFAULT true,
+      liberado_para_despacho BOOLEAN DEFAULT true,
+      liberado_para_planta BOOLEAN DEFAULT true,
+      emitido_por TEXT,
+      tenant_id TEXT DEFAULT 'hidroexpo',
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    ); CREATE TABLE IF NOT EXISTS public.war_room_eventos (
+      evento_id TEXT PRIMARY KEY,
+      origen_modulo TEXT,
+      tipo_evento TEXT,
+      severidad TEXT,
+      up_id TEXT,
+      titulo TEXT,
+      descripcion TEXT,
+      datos_json TEXT,
+      leido BOOLEAN DEFAULT false,
+      tenant_id TEXT DEFAULT 'hidroexpo',
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );`
+  }); });
+}
 </script>
 </body>
 </html>
